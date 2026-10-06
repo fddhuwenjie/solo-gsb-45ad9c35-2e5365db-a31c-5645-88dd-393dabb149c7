@@ -53,6 +53,18 @@ CREATE TRIGGER IF NOT EXISTS trg_group_cells_no_update BEFORE UPDATE ON group_ce
 BEGIN SELECT RAISE(ABORT, 'group snapshots are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_group_cells_no_delete BEFORE DELETE ON group_cells
 BEGIN SELECT RAISE(ABORT, 'group snapshots are immutable'); END;
+
+-- 安全隔离：一次写入即不可撤销；独立成表，既有库文件与 cells 表结构无需变更
+CREATE TABLE IF NOT EXISTS quarantines (
+    cell_id    TEXT PRIMARY KEY REFERENCES cells(cell_id),
+    reason     TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_quarantines_no_update BEFORE UPDATE ON quarantines
+BEGIN SELECT RAISE(ABORT, 'quarantine is irrevocable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_quarantines_no_delete BEFORE DELETE ON quarantines
+BEGIN SELECT RAISE(ABORT, 'quarantine is irrevocable'); END;
 """
 
 # 确认/写入路径上的互斥锁，配合 BEGIN IMMEDIATE 保证事务原子性

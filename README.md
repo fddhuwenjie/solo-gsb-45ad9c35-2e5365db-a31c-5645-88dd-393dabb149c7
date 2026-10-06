@@ -32,32 +32,39 @@ python -m pytest tests/ -q
 
 - **录入**：最多 12 节待选电芯，字段为 ID、化学体系、容量(Ah)、内阻(mΩ)、检测版本。
 - **复测修订**：`PUT /cells/{id}/test` 更新容量/内阻并提升检测版本。确认前复测会使
-  已预选候选过期；确认后复测只更新电芯档案，不改变已确认组的快照。
-- **预选**（只读，不占用）：从同一化学体系、未占用、容量不低于最低单芯容量的电芯中
-  选出 `series_count`（3~6）节，要求组内容量差、内阻差均不超过上限。目标：**使组内
+  已预选候选过期；确认后复测只更新电芯档案，不改变已确认组的快照；复测**不能解除隔离**。
+- **安全隔离**：`POST /cells/{id}/quarantine` 提交隔离原因，记录一次**不可撤销**的隔离
+  （`quarantines` 表由触发器禁止 UPDATE/DELETE）。电芯不存在返回 404；重复隔离返回
+  原记录（首次的原因与时间，不覆盖）。预选排除隔离电芯；确认时遇隔离整组拒绝；
+  已入组电芯被隔离后，组查询显示该组已阻断（`blocked`/`blocked_cells`），原检测快照
+  与组占用保留，未受影响组保持可放行（`blocked=false`）。
+- **预选**（只读，不占用）：从同一化学体系、未占用、**未隔离**、容量不低于最低单芯容量的
+  电芯中选出 `series_count`（3~6）节，要求组内容量差、内阻差均不超过上限。目标：**使组内
   最小容量最大**；同值时按电芯 ID 排序序列的字典序取最小者。返回候选 ID、受限容量
   （= 组内最小容量）及各芯检测版本；无可行组合时返回原因。
-- **确认**：在**一次 SQLite 事务**（`BEGIN IMMEDIATE`）中重查所有电芯的检测版本与
-  未占用状态，全部一致才原子地占用整组、写入组记录与检测快照；任何一节版本已变化
-  或已被别组占用，则**整组拒绝、回滚，不留部分占用**。
+- **确认**：在**一次 SQLite 事务**（`BEGIN IMMEDIATE`）中重查所有电芯的检测版本、
+  未占用状态与**隔离状态**，全部一致才原子地占用整组、写入组记录与检测快照；任何一节
+  版本已变化、已被别组占用或已被隔离，则**整组拒绝、回滚，不留部分占用**。
 - **快照不可改写**：`groups` / `group_cells` 表由触发器禁止 UPDATE/DELETE，可按组
   编号 `GET /groups/{group_id}` 查询，后续检测修订不影响已确认组。
 - **并发可见性**：每个请求使用各自线程的独立 SQLite 连接（WAL 模式），查询只能
   看到**已提交的完整快照**。确认事务提交前，`GET /groups`、`GET /groups/{id}`
   看不到该组，`GET /cells`、`POST /preselect` 也看不到临时占用；提交成功的瞬间
   整组（组记录 + 快照 + 占用）一次性可见，回滚则毫无痕迹。并发查询不会阻塞、
-  也不会干扰确认事务。
+  也不会干扰确认事务。隔离与确认同时发生时，以**提交先后**决定结果：隔离先提交
+  则确认整组拒绝，确认先提交则新组被标记阻断；查询不会看到半成品。
 
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/cells` | 录入电芯（最多 12 节） |
-| GET | `/cells` / `/cells/{id}` | 查询电芯 |
-| PUT | `/cells/{id}/test` | 复测修订（更新容量/内阻/检测版本） |
-| POST | `/preselect` | 预选成组（只读） |
-| POST | `/groups/confirm` | 确认候选（单事务原子占用 + 快照） |
-| GET | `/groups` / `/groups/{group_id}` | 查询已确认组及检测快照 |
+| GET | `/cells` / `/cells/{id}` | 查询电芯（含隔离状态） |
+| PUT | `/cells/{id}/test` | 复测修订（更新容量/内阻/检测版本，不解除隔离） |
+| POST | `/cells/{id}/quarantine` | 安全隔离（不可撤销；重复隔离返回原记录） |
+| POST | `/preselect` | 预选成组（只读，排除隔离电芯） |
+| POST | `/groups/confirm` | 确认候选（单事务原子占用 + 快照，重查隔离状态） |
+| GET | `/groups` / `/groups/{group_id}` | 查询已确认组及检测快照（含阻断状态） |
 
 ## 调用示例（curl）
 
@@ -146,7 +153,55 @@ curl -s -X POST http://localhost:8000/groups/confirm \
 已被别组抢先占用的电芯再次确认时同样返回 `409` 并整组拒绝。确认后对电芯的复测
 修订不会改变 `GET /groups/{group_id}` 返回的快照内容。
 
-### 6. 并发查询（确认事务与读取互不干扰）
+### 6. 安全隔离（不可撤销）
+
+```bash
+# 隔离 C002：201 返回隔离记录
+curl -s -X POST http://localhost:8000/cells/C002/quarantine \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"复检发现壳体破损"}'
+# {"cell_id":"C002","reason":"复检发现壳体破损","created_at":"2026-10-06T..."}
+
+# 重复隔离：200 返回原记录（首次的原因与时间，不覆盖）
+curl -s -X POST http://localhost:8000/cells/C002/quarantine \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"另一个原因"}'
+
+# 电芯不存在：404
+curl -s -X POST http://localhost:8000/cells/NOPE/quarantine \
+  -H 'Content-Type: application/json' -d '{"reason":"漏液"}'
+
+# 电芯查询可见隔离状态；复测（PUT /cells/C002/test）不会解除隔离
+curl -s http://localhost:8000/cells/C002
+# {"cell_id":"C002",...,"quarantined":true,"quarantine_reason":"复检发现壳体破损"}
+```
+
+隔离后的影响：
+
+- **预选**：`POST /preselect` 自动排除隔离电芯。
+- **确认**：候选中任一电芯已隔离 → `409` 整组拒绝，不产生组或部分占用：
+
+  ```json
+  {"detail":"电芯已被安全隔离，候选整组拒绝：[{'C002': '复检发现壳体破损'}]"}
+  ```
+
+- **已入组电芯被隔离**：`GET /groups` 与 `GET /groups/{group_id}` 显示该组已阻断、
+  涉及电芯与原因，原检测快照与组占用保留；未受影响组 `blocked` 为 `false`：
+
+  ```json
+  {
+    "group_id": 1, "chemistry": "LFP", "series_count": 4, "limited_capacity": 97.0,
+    "created_at": "2026-10-06T...",
+    "blocked": true,
+    "blocked_cells": [{"cell_id": "C002", "reason": "复检发现壳体破损"}],
+    "cells": [
+      {"cell_id": "C001", "capacity": 100.0, "resistance": 2.1, "test_version": "T1"},
+      {"cell_id": "C002", "capacity": 99.0,  "resistance": 2.2, "test_version": "T1"}
+    ]
+  }
+  ```
+
+### 7. 并发查询（确认事务与读取互不干扰）
 
 确认事务提交前，其他请求看不到它的任何中间状态；提交成功的瞬间，整组
 （组记录、检测快照、电芯占用）对所有请求一次性可见：
@@ -182,7 +237,7 @@ wait
 
 ```
 app/
-  main.py       # FastAPI 路由：录入 / 复测 / 预选 / 确认 / 快照查询
+  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 快照查询
   db.py         # 每线程 SQLite 连接（WAL）、schema、不可改写触发器、写锁
   selection.py  # 成组预选算法（穷举组合，最多 C(12,6)=924 种）
   schemas.py    # Pydantic 请求模型（串联节数 3~6 等校验）

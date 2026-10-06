@@ -3,19 +3,29 @@
 流程：录入电芯 -> 预选（只读，返回候选与检测版本）-> 确认（单事务重查版本与
 占用状态，原子占用整组并写入不可改写的检测快照）。
 
+安全隔离：任意电芯可随时提交隔离（不可撤销，复测不解除）。预选排除隔离电芯；
+确认事务在原事务中重查隔离状态，遇隔离整组拒绝；已入组电芯被隔离后，组查询
+显示该组已阻断及涉及电芯与原因，原检测快照与组占用保留，未受影响组保持可放行。
+
 每个请求使用各自线程的 SQLite 连接：查询只能看到已提交的完整快照，
 确认事务未提交的组记录、快照与临时占用对其他请求不可见。
 """
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse
 
 from . import db
-from .schemas import CellCreate, ConfirmRequest, PreselectRequest, TestRevision
+from .schemas import CellCreate, ConfirmRequest, PreselectRequest, QuarantineCreate, TestRevision
 from .selection import choose_group
 
 app = FastAPI(title="退役电芯成组放行 API", version="1.0.0")
+
+# 电芯查询统一带隔离状态（新增字段，既有字段保持不变）
+_CELL_SELECT = (
+    "SELECT c.*, (q.cell_id IS NOT NULL) AS quarantined, q.reason AS quarantine_reason"
+    " FROM cells c LEFT JOIN quarantines q ON q.cell_id = c.cell_id"
+)
 
 
 def _row_to_cell(row) -> dict:
@@ -27,6 +37,16 @@ def _row_to_cell(row) -> dict:
         "test_version": row["test_version"],
         "occupied": bool(row["occupied"]),
         "group_id": row["group_id"],
+        "quarantined": bool(row["quarantined"]),
+        "quarantine_reason": row["quarantine_reason"],
+    }
+
+
+def _row_to_quarantine(row) -> dict:
+    return {
+        "cell_id": row["cell_id"],
+        "reason": row["reason"],
+        "created_at": row["created_at"],
     }
 
 
@@ -57,22 +77,22 @@ def create_cell(body: CellCreate):
         except Exception:
             conn.rollback()
             raise
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (body.cell_id,)).fetchone()
+    row = conn.execute(_CELL_SELECT + " WHERE c.cell_id = ?", (body.cell_id,)).fetchone()
     return _row_to_cell(row)
 
 
 @app.get("/cells")
 def list_cells():
-    """电芯列表：只反映已提交的占用状态（确认提交后才看到整组占用）。"""
+    """电芯列表：只反映已提交的占用与隔离状态（确认提交后才看到整组占用）。"""
     conn = db.get_conn()
-    rows = conn.execute("SELECT * FROM cells ORDER BY cell_id").fetchall()
+    rows = conn.execute(_CELL_SELECT + " ORDER BY c.cell_id").fetchall()
     return {"count": len(rows), "cells": [_row_to_cell(r) for r in rows]}
 
 
 @app.get("/cells/{cell_id}")
 def get_cell(cell_id: str):
     conn = db.get_conn()
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
+    row = conn.execute(_CELL_SELECT + " WHERE c.cell_id = ?", (cell_id,)).fetchone()
     if row is None:
         raise HTTPException(404, f"电芯 {cell_id} 不存在")
     return _row_to_cell(row)
@@ -101,20 +121,61 @@ def revise_test(cell_id: str, body: TestRevision):
         except Exception:
             conn.rollback()
             raise
-    row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
+    row = conn.execute(_CELL_SELECT + " WHERE c.cell_id = ?", (cell_id,)).fetchone()
     return _row_to_cell(row)
+
+
+# ---------- 安全隔离 ----------
+
+@app.post("/cells/{cell_id}/quarantine", status_code=201)
+def quarantine_cell(cell_id: str, body: QuarantineCreate, response: Response):
+    """安全隔离：提交隔离原因，记录一次不可撤销的隔离。
+
+    电芯不存在 -> 404；重复隔离 -> 200 返回原记录（首次的原因与时间，不覆盖）；
+    隔离不可撤销（触发器禁止 UPDATE/DELETE），复测修订不影响隔离状态。
+    与确认并发时按提交先后生效：隔离先提交则确认整组拒绝，确认先提交则该组被阻断。
+    """
+    conn = db.get_conn()
+    with db.write_lock:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cell = conn.execute(
+                "SELECT 1 FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
+            if cell is None:
+                raise HTTPException(404, f"电芯 {cell_id} 不存在")
+            existing = conn.execute(
+                "SELECT * FROM quarantines WHERE cell_id = ?", (cell_id,)).fetchone()
+            if existing is not None:
+                conn.commit()
+                response.status_code = 200
+                return _row_to_quarantine(existing)
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO quarantines (cell_id, reason, created_at) VALUES (?, ?, ?)",
+                (cell_id, body.reason, now),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    row = conn.execute(
+        "SELECT * FROM quarantines WHERE cell_id = ?", (cell_id,)).fetchone()
+    return _row_to_quarantine(row)
 
 
 # ---------- 预选 ----------
 
 @app.post("/preselect")
 def preselect(body: PreselectRequest):
-    """按串联要求预选一组同体系、未占用电芯（只读，不占用）。
+    """按串联要求预选一组同体系、未占用且未隔离的电芯（只读，不占用）。
 
-    只统计已提交的占用状态：确认事务未提交的临时占用不可见。
+    只统计已提交的占用与隔离状态：确认事务未提交的临时占用不可见。
     """
     conn = db.get_conn()
-    rows = conn.execute("SELECT * FROM cells WHERE occupied = 0").fetchall()
+    rows = conn.execute(
+        _CELL_SELECT + " WHERE c.occupied = 0"
+        " AND c.cell_id NOT IN (SELECT cell_id FROM quarantines)"
+    ).fetchall()
     free = [_row_to_cell(r) for r in rows]
     if body.chemistry is not None:
         free = [c for c in free if c["chemistry"] == body.chemistry]
@@ -186,9 +247,10 @@ def _infeasible_reason(free: list[dict], body: PreselectRequest) -> str:
 
 @app.post("/groups/confirm", status_code=201)
 def confirm_group(body: ConfirmRequest):
-    """确认候选：单事务内重查检测版本与占用状态，全部一致才原子占用整组并写快照。
+    """确认候选：单事务内重查检测版本、占用与隔离状态，全部一致才原子占用整组并写快照。
 
-    任何一节版本已变化（确认前被复测）或已被别组占用 -> 整组拒绝，不留部分占用。
+    任何一节版本已变化（确认前被复测）、已被别组占用或已被安全隔离
+    -> 整组拒绝，不留部分占用。
     """
     ids = [c.cell_id for c in body.cells]
     if len(set(ids)) != len(ids):
@@ -208,6 +270,17 @@ def confirm_group(body: ConfirmRequest):
             missing = [i for i in ids if i not in found]
             if missing:
                 raise HTTPException(409, f"电芯不存在：{missing}")
+            quarantined = conn.execute(
+                "SELECT cell_id, reason FROM quarantines"
+                f" WHERE cell_id IN ({','.join('?' * len(ids))}) ORDER BY cell_id",
+                ids,
+            ).fetchall()
+            if quarantined:
+                raise HTTPException(
+                    409,
+                    "电芯已被安全隔离，候选整组拒绝："
+                    + str([{r["cell_id"]: r["reason"]} for r in quarantined]),
+                )
             occupied = [i for i in ids if found[i]["occupied"]]
             if occupied:
                 raise HTTPException(409, f"电芯已被其他组占用，候选过期：{occupied}")
@@ -255,12 +328,23 @@ def _group_payload(conn, group_id: int) -> dict:
     rows = conn.execute(
         "SELECT * FROM group_cells WHERE group_id = ? ORDER BY cell_id", (group_id,)
     ).fetchall()
+    # 追溯组成员的隔离状态：任一成员被隔离则整组阻断；快照与占用保持不变
+    qrows = conn.execute(
+        "SELECT q.cell_id, q.reason FROM quarantines q"
+        " JOIN group_cells gc ON gc.cell_id = q.cell_id"
+        " WHERE gc.group_id = ? ORDER BY q.cell_id",
+        (group_id,),
+    ).fetchall()
     return {
         "group_id": g["group_id"],
         "chemistry": g["chemistry"],
         "series_count": g["series_count"],
         "limited_capacity": g["limited_capacity"],
         "created_at": g["created_at"],
+        "blocked": len(qrows) > 0,
+        "blocked_cells": [
+            {"cell_id": r["cell_id"], "reason": r["reason"]} for r in qrows
+        ],
         "cells": [
             {
                 "cell_id": r["cell_id"],
@@ -275,7 +359,11 @@ def _group_payload(conn, group_id: int) -> dict:
 
 @app.get("/groups")
 def list_groups():
-    """组列表：同一已提交快照内的完整组（确认事务未提交的组不可见）。"""
+    """组列表：同一已提交快照内的完整组（确认事务未提交的组不可见）。
+
+    blocked/blocked_cells 反映当前隔离状态：组成员被隔离即阻断，
+    未受影响组保持可放行（blocked=false）。
+    """
     conn = db.get_conn()
     with db.read_snapshot(conn):
         rows = conn.execute("SELECT group_id FROM groups ORDER BY group_id").fetchall()
@@ -285,9 +373,10 @@ def list_groups():
 
 @app.get("/groups/{group_id}")
 def get_group(group_id: int):
-    """按组编号查询不可改写的检测快照（未提交或已回滚的组不可见）。"""
+    """按组编号查询不可改写的检测快照与当前阻断状态（未提交或已回滚的组不可见）。"""
     conn = db.get_conn()
-    g = conn.execute("SELECT 1 FROM groups WHERE group_id = ?", (group_id,)).fetchone()
-    if g is None:
-        raise HTTPException(404, f"组 {group_id} 不存在")
-    return _group_payload(conn, group_id)
+    with db.read_snapshot(conn):
+        g = conn.execute("SELECT 1 FROM groups WHERE group_id = ?", (group_id,)).fetchone()
+        if g is None:
+            raise HTTPException(404, f"组 {group_id} 不存在")
+        return _group_payload(conn, group_id)
