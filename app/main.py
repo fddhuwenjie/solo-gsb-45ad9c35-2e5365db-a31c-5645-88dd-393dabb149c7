@@ -1,10 +1,16 @@
 """退役电芯成组放行 API。
 
-流程：录入电芯 -> 预选（只读，返回候选与检测版本）-> 确认（单事务重查版本与
-占用状态，原子占用整组并写入不可改写的检测快照）。
+流程：录入电芯 -> 预选（只读，返回候选与检测版本）-> 确认（单事务重查版本、
+占用与隔离状态，原子占用整组并写入不可改写的检测快照）。
+
+安全隔离：任意电芯可随时提交隔离（不可撤销，复测不解除）。预选排除隔离电芯；
+确认事务在原事务中重查隔离状态，命中即整组拒绝；已入组电芯被隔离后，该组在
+组查询中显示为已阻断（附电芯 ID 与原因），原检测快照与组占用保留，未受影响
+的组保持可放行。隔离与确认都走同一写路径（写锁 + BEGIN IMMEDIATE），并发时
+以提交先后决定是拒绝候选还是阻断新组。
 
 每个请求使用各自线程的 SQLite 连接：查询只能看到已提交的完整快照，
-确认事务未提交的组记录、快照与临时占用对其他请求不可见。
+确认/隔离事务未提交的中间状态对其他请求不可见。
 """
 from datetime import datetime, timezone
 
@@ -12,13 +18,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from . import db
-from .schemas import CellCreate, ConfirmRequest, PreselectRequest, TestRevision
+from .schemas import CellCreate, ConfirmRequest, IsolateRequest, PreselectRequest, TestRevision
 from .selection import choose_group
 
-app = FastAPI(title="退役电芯成组放行 API", version="1.0.0")
+app = FastAPI(title="退役电芯成组放行 API", version="1.1.0")
 
 
-def _row_to_cell(row) -> dict:
+def _row_to_cell(conn, row) -> dict:
+    iso = conn.execute(
+        "SELECT 1 FROM isolations WHERE cell_id = ?", (row["cell_id"],)
+    ).fetchone()
     return {
         "cell_id": row["cell_id"],
         "chemistry": row["chemistry"],
@@ -27,6 +36,15 @@ def _row_to_cell(row) -> dict:
         "test_version": row["test_version"],
         "occupied": bool(row["occupied"]),
         "group_id": row["group_id"],
+        "isolated": iso is not None,
+    }
+
+
+def _isolation_payload(row) -> dict:
+    return {
+        "cell_id": row["cell_id"],
+        "reason": row["reason"],
+        "isolated_at": row["created_at"],
     }
 
 
@@ -58,15 +76,15 @@ def create_cell(body: CellCreate):
             conn.rollback()
             raise
     row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (body.cell_id,)).fetchone()
-    return _row_to_cell(row)
+    return _row_to_cell(conn, row)
 
 
 @app.get("/cells")
 def list_cells():
-    """电芯列表：只反映已提交的占用状态（确认提交后才看到整组占用）。"""
+    """电芯列表：只反映已提交的占用与隔离状态。"""
     conn = db.get_conn()
     rows = conn.execute("SELECT * FROM cells ORDER BY cell_id").fetchall()
-    return {"count": len(rows), "cells": [_row_to_cell(r) for r in rows]}
+    return {"count": len(rows), "cells": [_row_to_cell(conn, r) for r in rows]}
 
 
 @app.get("/cells/{cell_id}")
@@ -75,7 +93,7 @@ def get_cell(cell_id: str):
     row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
     if row is None:
         raise HTTPException(404, f"电芯 {cell_id} 不存在")
-    return _row_to_cell(row)
+    return _row_to_cell(conn, row)
 
 
 @app.put("/cells/{cell_id}/test")
@@ -102,20 +120,71 @@ def revise_test(cell_id: str, body: TestRevision):
             conn.rollback()
             raise
     row = conn.execute("SELECT * FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
-    return _row_to_cell(row)
+    return _row_to_cell(conn, row)
+
+
+# ---------- 安全隔离 ----------
+
+@app.post("/cells/{cell_id}/isolate")
+def isolate_cell(cell_id: str, body: IsolateRequest):
+    """提交安全隔离：记录一节电芯的隔离原因，隔离不可撤销（复测也不解除）。
+
+    电芯不存在返回 404；重复隔离不新增记录，返回首次隔离的原记录（200）。
+    与确认共用同一写路径：并发时以提交先后决定是拒绝候选还是阻断新组。
+    """
+    conn = db.get_conn()
+    with db.write_lock:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM cells WHERE cell_id = ?", (cell_id,)).fetchone()
+            if row is None:
+                raise HTTPException(404, f"电芯 {cell_id} 不存在")
+            existing = conn.execute(
+                "SELECT * FROM isolations WHERE cell_id = ?", (cell_id,)).fetchone()
+            created = existing is None
+            if created:
+                now = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    "INSERT INTO isolations (cell_id, reason, created_at)"
+                    " VALUES (?, ?, ?)",
+                    (cell_id, body.reason, now),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    rec = conn.execute(
+        "SELECT * FROM isolations WHERE cell_id = ?", (cell_id,)).fetchone()
+    payload = _isolation_payload(rec)
+    if created:
+        return JSONResponse(status_code=201, content=payload)
+    return payload  # 重复隔离：返回首次隔离的原记录
+
+
+@app.get("/isolations")
+def list_isolations():
+    """隔离记录列表（只反映已提交的隔离，用于受影响范围追溯）。"""
+    conn = db.get_conn()
+    rows = conn.execute(
+        "SELECT * FROM isolations ORDER BY created_at, cell_id").fetchall()
+    return {"count": len(rows), "isolations": [_isolation_payload(r) for r in rows]}
 
 
 # ---------- 预选 ----------
 
 @app.post("/preselect")
 def preselect(body: PreselectRequest):
-    """按串联要求预选一组同体系、未占用电芯（只读，不占用）。
+    """按串联要求预选一组同体系、未占用、未隔离电芯（只读，不占用）。
 
-    只统计已提交的占用状态：确认事务未提交的临时占用不可见。
+    只统计已提交的占用与隔离状态：确认/隔离事务未提交的中间状态不可见。
     """
     conn = db.get_conn()
-    rows = conn.execute("SELECT * FROM cells WHERE occupied = 0").fetchall()
-    free = [_row_to_cell(r) for r in rows]
+    rows = conn.execute(
+        "SELECT * FROM cells WHERE occupied = 0"
+        " AND cell_id NOT IN (SELECT cell_id FROM isolations)"
+    ).fetchall()
+    free = [_row_to_cell(conn, r) for r in rows]
     if body.chemistry is not None:
         free = [c for c in free if c["chemistry"] == body.chemistry]
 
@@ -186,9 +255,10 @@ def _infeasible_reason(free: list[dict], body: PreselectRequest) -> str:
 
 @app.post("/groups/confirm", status_code=201)
 def confirm_group(body: ConfirmRequest):
-    """确认候选：单事务内重查检测版本与占用状态，全部一致才原子占用整组并写快照。
+    """确认候选：单事务内重查检测版本、占用与隔离状态，全部一致才原子占用整组并写快照。
 
-    任何一节版本已变化（确认前被复测）或已被别组占用 -> 整组拒绝，不留部分占用。
+    任何一节版本已变化（确认前被复测）、已被别组占用或已被安全隔离
+    -> 整组拒绝，不产生组记录，也不留部分占用。
     """
     ids = [c.cell_id for c in body.cells]
     if len(set(ids)) != len(ids):
@@ -208,6 +278,15 @@ def confirm_group(body: ConfirmRequest):
             missing = [i for i in ids if i not in found]
             if missing:
                 raise HTTPException(409, f"电芯不存在：{missing}")
+            iso_rows = conn.execute(
+                f"SELECT cell_id FROM isolations WHERE cell_id IN"
+                f" ({','.join('?' * len(ids))})",
+                ids,
+            ).fetchall()
+            isolated = [r["cell_id"] for r in iso_rows]
+            if isolated:
+                raise HTTPException(
+                    409, f"电芯已被安全隔离，候选整组拒绝：{sorted(isolated)}")
             occupied = [i for i in ids if found[i]["occupied"]]
             if occupied:
                 raise HTTPException(409, f"电芯已被其他组占用，候选过期：{occupied}")
@@ -255,12 +334,24 @@ def _group_payload(conn, group_id: int) -> dict:
     rows = conn.execute(
         "SELECT * FROM group_cells WHERE group_id = ? ORDER BY cell_id", (group_id,)
     ).fetchall()
+    # 受影响追溯：组内当前被隔离的电芯（原检测快照不受影响，照常返回）
+    blocked = conn.execute(
+        "SELECT i.cell_id, i.reason, i.created_at FROM isolations i"
+        " JOIN group_cells gc ON gc.group_id = ? AND gc.cell_id = i.cell_id"
+        " ORDER BY i.cell_id",
+        (group_id,),
+    ).fetchall()
     return {
         "group_id": g["group_id"],
         "chemistry": g["chemistry"],
         "series_count": g["series_count"],
         "limited_capacity": g["limited_capacity"],
         "created_at": g["created_at"],
+        "blocked": len(blocked) > 0,  # True=已阻断不可放行；False=未受影响，保持可放行
+        "blocked_cells": [
+            {"cell_id": r["cell_id"], "reason": r["reason"], "isolated_at": r["created_at"]}
+            for r in blocked
+        ],
         "cells": [
             {
                 "cell_id": r["cell_id"],
@@ -275,7 +366,10 @@ def _group_payload(conn, group_id: int) -> dict:
 
 @app.get("/groups")
 def list_groups():
-    """组列表：同一已提交快照内的完整组（确认事务未提交的组不可见）。"""
+    """组列表：同一已提交快照内的完整组（确认事务未提交的组不可见）。
+
+    每组附带当前阻断状态：组内电芯被隔离则 blocked=true 并列出电芯 ID 与原因。
+    """
     conn = db.get_conn()
     with db.read_snapshot(conn):
         rows = conn.execute("SELECT group_id FROM groups ORDER BY group_id").fetchall()
@@ -285,7 +379,7 @@ def list_groups():
 
 @app.get("/groups/{group_id}")
 def get_group(group_id: int):
-    """按组编号查询不可改写的检测快照（未提交或已回滚的组不可见）。"""
+    """按组编号查询不可改写的检测快照与当前阻断状态（未提交或已回滚的组不可见）。"""
     conn = db.get_conn()
     g = conn.execute("SELECT 1 FROM groups WHERE group_id = ?", (group_id,)).fetchone()
     if g is None:

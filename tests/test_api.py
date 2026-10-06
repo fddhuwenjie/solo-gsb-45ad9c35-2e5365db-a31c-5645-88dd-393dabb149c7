@@ -41,6 +41,16 @@ def seed_six(client):
         add_cell(client, cid, capacity=cap, resistance=res)
 
 
+def isolate(client, cell_id, reason="检出安全隐患"):
+    return client.post(f"/cells/{cell_id}/isolate", json={"reason": reason})
+
+
+PRESELECT4 = {
+    "series_count": 4, "min_capacity": 90.0,
+    "max_capacity_diff": 5.0, "max_resistance_diff": 0.5,
+}
+
+
 def test_register_limit_12(client):
     for i in range(12):
         add_cell(client, f"C{i:03d}")
@@ -327,3 +337,204 @@ def test_concurrent_confirm_and_reads_do_not_interfere(client):
     assert statuses.count(409) == 3
     assert not broken
     assert client.get("/groups").json()["count"] == 1
+
+
+# ---------- 安全隔离 ----------
+
+def test_isolate_cell_records_isolation(client):
+    add_cell(client, "C001")
+    r = isolate(client, "C001", "外壳鼓包")
+    assert r.status_code == 201
+    body = r.json()
+    assert body["cell_id"] == "C001"
+    assert body["reason"] == "外壳鼓包"
+    assert body["isolated_at"]
+    # 电芯档案带隔离标记（新增字段，原字段保持不变）
+    cell = client.get("/cells/C001").json()
+    assert cell["isolated"] is True
+    assert cell["occupied"] is False
+    # 隔离列表可追溯
+    lst = client.get("/isolations").json()
+    assert lst["count"] == 1
+    assert lst["isolations"][0]["cell_id"] == "C001"
+    assert lst["isolations"][0]["reason"] == "外壳鼓包"
+
+
+def test_isolate_missing_cell_404(client):
+    r = isolate(client, "NOPE")
+    assert r.status_code == 404
+    assert "NOPE" in r.json()["detail"]
+
+
+def test_repeat_isolation_returns_original_record(client):
+    add_cell(client, "C001")
+    first = isolate(client, "C001", "首次原因")
+    assert first.status_code == 201
+    # 重复隔离（即使原因不同）返回首次隔离的原记录，不新增、不改写
+    again = isolate(client, "C001", "不同的新原因")
+    assert again.status_code == 200
+    assert again.json() == first.json()
+    assert client.get("/isolations").json()["count"] == 1
+
+
+def test_isolation_irreversible_no_delete_endpoint(client):
+    add_cell(client, "C001")
+    isolate(client, "C001")
+    assert client.delete("/cells/C001/isolate").status_code == 405
+    assert client.get("/isolations").json()["count"] == 1
+
+
+def test_retest_cannot_clear_isolation(client):
+    add_cell(client, "C001")
+    isolate(client, "C001", "热失控风险")
+    # 复测只更新检测档案，隔离记录保持不变
+    r = client.put("/cells/C001/test", json={
+        "capacity": 98.0, "resistance": 2.0, "test_version": "T2"})
+    assert r.status_code == 200
+    assert r.json()["isolated"] is True
+    lst = client.get("/isolations").json()
+    assert lst["count"] == 1
+    assert lst["isolations"][0]["reason"] == "热失控风险"
+
+
+def test_preselect_excludes_isolated_cells(client):
+    seed_six(client)
+    isolate(client, "C001", "待复检")
+    body = client.post("/preselect", json=PRESELECT4).json()
+    assert body["feasible"] is True
+    # 最优组合跳过 C001，顺延为 C002~C005
+    assert body["cell_ids"] == ["C002", "C003", "C004", "C005"]
+    assert body["limited_capacity"] == 96.0
+    # 隔离到剩余不足成组时，预选判不可行
+    for cid in ("C002", "C003", "C004"):
+        isolate(client, cid, "待复检")
+    body = client.post("/preselect", json=PRESELECT4).json()
+    assert body["feasible"] is False
+    assert "不足 4 节" in body["reason"]
+
+
+def test_confirm_rechecks_isolation_and_rejects_atomically(client):
+    seed_six(client)
+    pre = client.post("/preselect", json=PRESELECT4).json()
+    # 预选后、确认前隔离候选中的一节 -> 确认事务重查时命中，整组拒绝
+    isolate(client, "C002", "复检不合格")
+    payload = {"cells": [{"cell_id": c["cell_id"], "test_version": c["test_version"]}
+                         for c in pre["cells"]]}
+    r = client.post("/groups/confirm", json=payload)
+    assert r.status_code == 409
+    assert "C002" in r.json()["detail"]
+    # 整组拒绝：不产生组，也不留任何部分占用
+    assert client.get("/groups").json()["count"] == 0
+    assert all(not c["occupied"] for c in client.get("/cells").json()["cells"])
+
+
+def _confirm(client, ids):
+    return client.post("/groups/confirm", json={
+        "cells": [{"cell_id": i, "test_version": "T1"} for i in ids]})
+
+
+def test_isolating_grouped_cell_blocks_group_snapshot_retained(client):
+    seed_six(client)
+    assert _confirm(client, ["C001", "C002", "C003"]).status_code == 201
+    assert _confirm(client, ["C004", "C005", "C006"]).status_code == 201
+
+    # 隔离已入组（组 1）的电芯
+    assert isolate(client, "C002", "抽检发现漏液").status_code == 201
+
+    groups = {g["group_id"]: g for g in client.get("/groups").json()["groups"]}
+    g1, g2 = groups[1], groups[2]
+    # 组 1 已阻断：显示涉及的电芯 ID 与原因
+    assert g1["blocked"] is True
+    assert [b["cell_id"] for b in g1["blocked_cells"]] == ["C002"]
+    assert g1["blocked_cells"][0]["reason"] == "抽检发现漏液"
+    assert g1["blocked_cells"][0]["isolated_at"]
+    # 原检测快照保留不变
+    assert [c["cell_id"] for c in g1["cells"]] == ["C001", "C002", "C003"]
+    c002 = next(c for c in g1["cells"] if c["cell_id"] == "C002")
+    assert c002["capacity"] == 99.0 and c002["test_version"] == "T1"
+    assert g1["limited_capacity"] == 98.0
+    # 组占用保留
+    cells = {c["cell_id"]: c for c in client.get("/cells").json()["cells"]}
+    assert cells["C002"]["occupied"] is True
+    assert cells["C002"]["group_id"] == 1
+    # 未受影响的组 2 保持可放行
+    assert g2["blocked"] is False
+    assert g2["blocked_cells"] == []
+
+    # 按组编号查询同样显示阻断信息与完整快照
+    one = client.get("/groups/1").json()
+    assert one["blocked"] is True
+    assert [b["cell_id"] for b in one["blocked_cells"]] == ["C002"]
+    assert one["cells"] == g1["cells"]
+    assert client.get("/groups/2").json()["blocked"] is False
+
+
+def test_uncommitted_isolation_invisible_to_other_requests(client):
+    """隔离事务未提交时，其他请求看不到；提交后预选立即排除该电芯。"""
+    seed_six(client)
+    from app import db
+    conn = db.get_conn()
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO isolations (cell_id, reason, created_at)"
+        " VALUES ('C001', '排查中', '2026-10-06T00:00:00+00:00')")
+    # 未提交：预选、隔离列表、电芯档案都看不到这条隔离
+    pre = client.post("/preselect", json=PRESELECT4).json()
+    assert pre["cell_ids"] == ["C001", "C002", "C003", "C004"]
+    assert client.get("/isolations").json()["count"] == 0
+    assert client.get("/cells/C001").json()["isolated"] is False
+    # 提交后：一次性可见，预选排除 C001
+    conn.commit()
+    pre = client.post("/preselect", json=PRESELECT4).json()
+    assert pre["cell_ids"] == ["C002", "C003", "C004", "C005"]
+    assert client.get("/isolations").json()["count"] == 1
+    assert client.get("/cells/C001").json()["isolated"] is True
+
+
+def test_isolation_and_confirm_race_commit_order_decides(client):
+    """隔离与确认并发：以提交先后决定是拒绝候选还是阻断新组，查询不见半成品。"""
+    seed_six(client)
+    from app.main import app
+    payload = {"cells": [{"cell_id": f"C00{i}", "test_version": "T1"} for i in range(1, 5)]}
+    results = {}
+    broken = []
+
+    def do_confirm():
+        with TestClient(app) as c:
+            results["confirm"] = c.post("/groups/confirm", json=payload).status_code
+
+    def do_isolate():
+        with TestClient(app) as c:
+            results["isolate"] = c.post(
+                "/cells/C002/isolate", json={"reason": "并发隔离"}).status_code
+            for _ in range(10):
+                # 任何可见的组都必须带完整快照，阻断标记与隔离记录一致
+                for g in c.get("/groups").json()["groups"]:
+                    if len(g["cells"]) != g["series_count"]:
+                        broken.append(g)
+                    if g["blocked"] and not g["blocked_cells"]:
+                        broken.append(g)
+
+    threads = [threading.Thread(target=do_confirm), threading.Thread(target=do_isolate)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not broken
+    assert results["isolate"] == 201  # 隔离本身总是成功
+    groups = client.get("/groups").json()["groups"]
+    if results["confirm"] == 201:
+        # 确认先提交：新组产生，随后的隔离使其阻断；快照完整、占用保留
+        assert len(groups) == 1
+        g = groups[0]
+        assert g["blocked"] is True
+        assert [b["cell_id"] for b in g["blocked_cells"]] == ["C002"]
+        assert len(g["cells"]) == 4
+        used = {c["cell_id"] for c in client.get("/cells").json()["cells"] if c["occupied"]}
+        assert used == {"C001", "C002", "C003", "C004"}
+    else:
+        # 隔离先提交：确认整组拒绝，不产生组或部分占用
+        assert results["confirm"] == 409
+        assert groups == []
+        assert all(not c["occupied"] for c in client.get("/cells").json()["cells"])

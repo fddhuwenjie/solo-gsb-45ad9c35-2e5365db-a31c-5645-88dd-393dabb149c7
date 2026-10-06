@@ -32,32 +32,42 @@ python -m pytest tests/ -q
 
 - **录入**：最多 12 节待选电芯，字段为 ID、化学体系、容量(Ah)、内阻(mΩ)、检测版本。
 - **复测修订**：`PUT /cells/{id}/test` 更新容量/内阻并提升检测版本。确认前复测会使
-  已预选候选过期；确认后复测只更新电芯档案，不改变已确认组的快照。
-- **预选**（只读，不占用）：从同一化学体系、未占用、容量不低于最低单芯容量的电芯中
-  选出 `series_count`（3~6）节，要求组内容量差、内阻差均不超过上限。目标：**使组内
-  最小容量最大**；同值时按电芯 ID 排序序列的字典序取最小者。返回候选 ID、受限容量
-  （= 组内最小容量）及各芯检测版本；无可行组合时返回原因。
-- **确认**：在**一次 SQLite 事务**（`BEGIN IMMEDIATE`）中重查所有电芯的检测版本与
-  未占用状态，全部一致才原子地占用整组、写入组记录与检测快照；任何一节版本已变化
-  或已被别组占用，则**整组拒绝、回滚，不留部分占用**。
-- **快照不可改写**：`groups` / `group_cells` 表由触发器禁止 UPDATE/DELETE，可按组
-  编号 `GET /groups/{group_id}` 查询，后续检测修订不影响已确认组。
+  已预选候选过期；确认后复测只更新电芯档案，不改变已确认组的快照。复测**不能解除**
+  已提交的隔离。
+- **安全隔离**：`POST /cells/{id}/isolate` 提交隔离原因，记录一次**不可撤销**的隔离
+  （无解除接口，数据库触发器禁止 UPDATE/DELETE）。电芯不存在返回 404；重复隔离返回
+  首次隔离的原记录（200），不新增、不改写。预选自动排除隔离电芯；确认事务会重查
+  隔离状态，命中即整组拒绝。已入组电芯被隔离后，该组在 `GET /groups` /
+  `GET /groups/{group_id}` 中显示 `blocked: true` 及涉及的电芯 ID 与原因，原检测
+  快照与组占用保留；未受影响的组 `blocked: false`，保持可放行。
+- **预选**（只读，不占用）：从同一化学体系、未占用、未隔离、容量不低于最低单芯容量
+  的电芯中选出 `series_count`（3~6）节，要求组内容量差、内阻差均不超过上限。目标：
+  **使组内最小容量最大**；同值时按电芯 ID 排序序列的字典序取最小者。返回候选 ID、
+  受限容量（= 组内最小容量）及各芯检测版本；无可行组合时返回原因。
+- **确认**：在**一次 SQLite 事务**（`BEGIN IMMEDIATE`）中重查所有电芯的检测版本、
+  未占用状态与隔离状态，全部一致才原子地占用整组、写入组记录与检测快照；任何一节
+  版本已变化、已被别组占用或已被隔离，则**整组拒绝、回滚，不产生组也不留部分占用**。
+- **快照不可改写**：`groups` / `group_cells` / `isolations` 表由触发器禁止
+  UPDATE/DELETE，可按组编号 `GET /groups/{group_id}` 查询，后续检测修订与隔离
+  不影响已确认组的快照内容。
 - **并发可见性**：每个请求使用各自线程的独立 SQLite 连接（WAL 模式），查询只能
-  看到**已提交的完整快照**。确认事务提交前，`GET /groups`、`GET /groups/{id}`
-  看不到该组，`GET /cells`、`POST /preselect` 也看不到临时占用；提交成功的瞬间
-  整组（组记录 + 快照 + 占用）一次性可见，回滚则毫无痕迹。并发查询不会阻塞、
-  也不会干扰确认事务。
+  看到**已提交的完整快照**。确认/隔离事务提交前，其他请求看不到其中间状态；提交
+  成功的瞬间整组（组记录 + 快照 + 占用）或隔离记录一次性可见，回滚则毫无痕迹。
+  隔离与确认同时发生时，以**提交先后**决定是拒绝候选（隔离先提交）还是阻断新组
+  （确认先提交），查询不会显示半成品。并发查询不会阻塞、也不会干扰写事务。
 
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/cells` | 录入电芯（最多 12 节） |
-| GET | `/cells` / `/cells/{id}` | 查询电芯 |
-| PUT | `/cells/{id}/test` | 复测修订（更新容量/内阻/检测版本） |
-| POST | `/preselect` | 预选成组（只读） |
-| POST | `/groups/confirm` | 确认候选（单事务原子占用 + 快照） |
-| GET | `/groups` / `/groups/{group_id}` | 查询已确认组及检测快照 |
+| GET | `/cells` / `/cells/{id}` | 查询电芯（含 `isolated` 隔离标记） |
+| PUT | `/cells/{id}/test` | 复测修订（更新容量/内阻/检测版本，不解除隔离） |
+| POST | `/cells/{id}/isolate` | 安全隔离（不可撤销；重复提交返回原记录） |
+| GET | `/isolations` | 隔离记录列表（受影响范围追溯） |
+| POST | `/preselect` | 预选成组（只读，排除已隔离电芯） |
+| POST | `/groups/confirm` | 确认候选（单事务重查版本/占用/隔离，原子占用 + 快照） |
+| GET | `/groups` / `/groups/{group_id}` | 查询已确认组：检测快照 + 当前阻断状态 |
 
 ## 调用示例（curl）
 
@@ -124,7 +134,69 @@ curl -s -X POST http://localhost:8000/groups/confirm \
 curl -s http://localhost:8000/groups/1
 ```
 
-### 5. 候选过期场景（确认前复测 → 整组拒绝）
+响应包含不可改写的检测快照与当前阻断状态（未受影响时 `blocked` 为 `false`、
+`blocked_cells` 为空，表示该组保持可放行）：
+
+```json
+{
+  "group_id": 1,
+  "chemistry": "LFP",
+  "series_count": 4,
+  "limited_capacity": 97.0,
+  "created_at": "2026-10-06T01:23:45.678901+00:00",
+  "blocked": false,
+  "blocked_cells": [],
+  "cells": [
+    {"cell_id": "C001", "capacity": 100.0, "resistance": 2.1, "test_version": "T1"}
+  ]
+}
+```
+
+### 5. 安全隔离（不可撤销）
+
+```bash
+# 提交电芯 ID 和隔离原因 -> 201 记录一次不可撤销的隔离
+curl -s -X POST http://localhost:8000/cells/C005/isolate \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"抽检发现漏液"}'
+# {"cell_id":"C005","reason":"抽检发现漏液","isolated_at":"2026-10-06T02:00:00.000000+00:00"}
+
+# 电芯不存在 -> 404
+curl -s -X POST http://localhost:8000/cells/NOPE/isolate \
+  -H 'Content-Type: application/json' -d '{"reason":"x"}'
+# {"detail":"电芯 NOPE 不存在"}
+
+# 重复隔离 -> 200 返回首次隔离的原记录（原因与时间戳不变，不新增记录）
+curl -s -X POST http://localhost:8000/cells/C005/isolate \
+  -H 'Content-Type: application/json' -d '{"reason":"另一个原因"}'
+
+# 隔离记录列表（受影响范围追溯）
+curl -s http://localhost:8000/isolations
+```
+
+隔离的影响：
+
+- **预选**：`POST /preselect` 自动排除已隔离电芯；
+- **确认**：`POST /groups/confirm` 在确认事务中重查隔离状态，候选中任何一节
+  已被隔离即整组拒绝（`409`），不产生组也不留部分占用；
+- **已入组电芯被隔离**：`GET /groups` 与 `GET /groups/{group_id}` 中该组显示
+  已阻断及涉及的电芯 ID 与原因，原检测快照与组占用保留：
+
+```json
+{
+  "group_id": 1,
+  "blocked": true,
+  "blocked_cells": [
+    {"cell_id": "C002", "reason": "抽检发现漏液", "isolated_at": "2026-10-06T02:00:00.000000+00:00"}
+  ],
+  "cells": ["...原检测快照保持不变..."]
+}
+```
+
+- **复测不能解除隔离**：`PUT /cells/{id}/test` 只更新检测档案，隔离记录保持不变；
+  隔离没有解除接口，数据库触发器禁止对隔离记录的 UPDATE/DELETE。
+
+### 6. 候选过期场景（确认前复测 → 整组拒绝）
 
 ```bash
 # 预选后、确认前对 C002 复测，检测版本变为 T2
@@ -146,7 +218,7 @@ curl -s -X POST http://localhost:8000/groups/confirm \
 已被别组抢先占用的电芯再次确认时同样返回 `409` 并整组拒绝。确认后对电芯的复测
 修订不会改变 `GET /groups/{group_id}` 返回的快照内容。
 
-### 6. 并发查询（确认事务与读取互不干扰）
+### 7. 并发查询（确认事务与读取互不干扰）
 
 确认事务提交前，其他请求看不到它的任何中间状态；提交成功的瞬间，整组
 （组记录、检测快照、电芯占用）对所有请求一次性可见：
@@ -175,6 +247,9 @@ wait
   该组；若确认失败回滚，该组始终不可见。
 - `/cells` 与 `/preselect` 在确认提交前看不到临时占用；提交成功后整组占用
   一次性可见。
+- 隔离与确认并发时，以**提交先后**决定结果：隔离先提交则确认整组拒绝（无组、
+  无占用）；确认先提交则新组产生并随即显示为已阻断。任何时刻查询都不会看到
+  半成品状态。
 - 读取与确认并发执行互不影响：读取永远拿到一致的已提交状态，确认事务照常
   原子提交或整组回滚。
 
@@ -182,10 +257,10 @@ wait
 
 ```
 app/
-  main.py       # FastAPI 路由：录入 / 复测 / 预选 / 确认 / 快照查询
+  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 快照与阻断查询
   db.py         # 每线程 SQLite 连接（WAL）、schema、不可改写触发器、写锁
   selection.py  # 成组预选算法（穷举组合，最多 C(12,6)=924 种）
-  schemas.py    # Pydantic 请求模型（串联节数 3~6 等校验）
+  schemas.py    # Pydantic 请求模型（串联节数 3~6、隔离原因等校验）
 tests/test_api.py
 Dockerfile / docker-compose.yml
 ```

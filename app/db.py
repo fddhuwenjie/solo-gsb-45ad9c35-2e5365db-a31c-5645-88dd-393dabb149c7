@@ -45,6 +45,13 @@ CREATE TABLE IF NOT EXISTS group_cells (
     PRIMARY KEY (group_id, cell_id)
 );
 
+-- 安全隔离：每节电芯最多一条记录，一旦写入不可撤销（复测也不解除）
+CREATE TABLE IF NOT EXISTS isolations (
+    cell_id    TEXT PRIMARY KEY REFERENCES cells(cell_id),
+    reason     TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TRIGGER IF NOT EXISTS trg_groups_no_update BEFORE UPDATE ON groups
 BEGIN SELECT RAISE(ABORT, 'groups are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_groups_no_delete BEFORE DELETE ON groups
@@ -53,6 +60,10 @@ CREATE TRIGGER IF NOT EXISTS trg_group_cells_no_update BEFORE UPDATE ON group_ce
 BEGIN SELECT RAISE(ABORT, 'group snapshots are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_group_cells_no_delete BEFORE DELETE ON group_cells
 BEGIN SELECT RAISE(ABORT, 'group snapshots are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_isolations_no_update BEFORE UPDATE ON isolations
+BEGIN SELECT RAISE(ABORT, 'isolations are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_isolations_no_delete BEFORE DELETE ON isolations
+BEGIN SELECT RAISE(ABORT, 'isolations are immutable'); END;
 """
 
 # 确认/写入路径上的互斥锁，配合 BEGIN IMMEDIATE 保证事务原子性

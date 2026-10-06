@@ -18,6 +18,12 @@ class TestRevision(BaseModel):
     test_version: str = Field(min_length=1, max_length=64)
 
 
+class IsolateRequest(BaseModel):
+    """安全隔离：提交隔离原因，记录一次不可撤销的隔离（复测不解除）。"""
+
+    reason: str = Field(min_length=1, max_length=500, description="隔离原因")
+
+
 class PreselectRequest(BaseModel):
     series_count: int = Field(ge=3, le=6, description="串联节数 3~6")
     min_capacity: float = Field(gt=0, description="最低单芯容量 Ah")
